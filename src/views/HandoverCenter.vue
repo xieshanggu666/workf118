@@ -311,9 +311,10 @@ onMounted(async () => {
         <div class="ho-docs">
           <div v-for="item in h.items" :key="item.docId" class="hd">
             <div class="hd-line">
-              <span class="hd-title" @click="docById[item.docId] && router.push('/docs/' + item.docId)">
+              <span class="hd-title" :class="{ gone: !docById[item.docId] }" @click="docById[item.docId] && router.push('/docs/' + item.docId)">
                 {{ docById[item.docId]?.title || item.title }}
               </span>
+              <span v-if="!docById[item.docId]" class="hd-gone">文档已删除</span>
               <span class="hd-to">
                 →
                 <span class="ava" :style="{ background: avatarColor(item.toUserId) }">{{ userById[item.toUserId]?.avatar || '?' }}</span>
@@ -324,6 +325,7 @@ onMounted(async () => {
             </div>
             <div v-if="item.result" class="hd-result">✅ {{ itemResultText(item) }}</div>
             <div v-if="item.status === HANDOVER.FAILED && item.failReason" class="hd-fail">⚠ {{ item.failReason }}</div>
+            <div v-else-if="item.failReason && item.status === 'cancelled' && !docById[item.docId]" class="hd-fail">⚠ {{ item.failReason }}</div>
             <div v-else-if="item.decideNote" class="hd-note">“{{ item.decideNote }}”</div>
             <!-- 接任者：按篇确认 / 谢绝 -->
             <div v-if="canConfirmItem(item, auth.user?.id)" class="hd-acts">
@@ -434,6 +436,9 @@ onMounted(async () => {
 .hd-line { display: flex; align-items: center; gap: 10px; }
 .hd-title { font-weight: 600; font-size: 13px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .hd-title:hover { color: var(--primary); }
+.hd-title.gone { color: var(--text-3); text-decoration: line-through; cursor: default; }
+.hd-title.gone:hover { color: var(--text-3); }
+.hd-gone { font-size: 11px; color: #b91c1c; background: #fee2e2; border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .hd-to { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
 .hd-result { margin-top: 4px; font-size: 12px; color: #15803d; }
 .hd-fail { margin-top: 4px; font-size: 12px; color: #b91c1c; }

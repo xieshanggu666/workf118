@@ -519,5 +519,71 @@ assert(handoverStatusOf(mk('declined', 'declined')) === HANDOVER.DECLINED, '全�
 assert(handoverStatusOf(mk('failed')) === HANDOVER.FAILED, '全部失败 → 已失败回退')
 assert(isHandoverOpen(mk('pending_confirm')) && isHandoverOpen(mk('confirmed')) && !isHandoverOpen(mk('completed')), '流转中判定')
 
+// ---------- 12. 文档在交接流转中被删除 → 流转篇自动取消，不留悬挂待办 ----------
+console.log('\n[12] 交接流转中文档删除：待确认/待批准篇随删除自动取消')
+// 12.1 待确认阶段：接任者尚未确认，管理员删除文档
+const docM = await mkDoc()
+r = await handover.initiateHandover({ items: [{ docId: docM.id, toUserId: next.id }], revokeMode: 'keep', note: '' }, owner)
+const hoM = r.handover
+assert(handover.pendingConfirmFor(next.id).some((h) => h.id === hoM.id), '删除前：接任者有待确认事项')
+r = await kb.deleteDoc(docM.id, admin)
+assert(r.status === 'ok', '管理员删除交接中的文档成功')
+const hoMDone = await getHo(hoM.id)
+assert(itemOf(hoMDone, docM.id).status === HO_ITEM.CANCELLED, '待确认篇随文档删除自动取消')
+assert(itemOf(hoMDone, docM.id).failReason.includes('文档已删除'), '自动取消原因随篇留档')
+assert(hoMDone.status === HANDOVER.CANCELLED, '唯一篇取消 → 批次已取消')
+assert(!handover.pendingConfirmFor(next.id).some((h) => h.id === hoM.id), '删除后：接任者待确认列表不再出现该单')
+assert(hoMDone.timeline.some((t) => t.action === 'cancel' && t.note.includes(docM.title)), '交接单留有文档删除联动取消的留痕')
+
+// 12.2 已确认待批准阶段：接任者已确认，管理员删除文档，管理员待批准列表同步清空
+const docN = await mkDoc()
+r = await handover.initiateHandover({ items: [{ docId: docN.id, toUserId: next.id }], revokeMode: 'keep', note: '' }, owner)
+const hoN = r.handover
+await handover.confirmHandover(hoN.id, [docN.id], next)
+assert(handover.pendingApprovalFor(admin.role).some((h) => h.id === hoN.id), '删除前：管理员有待批准事项')
+await kb.deleteDoc(docN.id, admin)
+const hoNDone = await getHo(hoN.id)
+assert(itemOf(hoNDone, docN.id).status === HO_ITEM.CANCELLED, '待批准篇随文档删除自动取消')
+assert(!handover.pendingApprovalFor(admin.role).some((h) => h.id === hoN.id), '删除后：管理员待批准列表不再出现该单')
+assert(handover.pendingCountFor(next.id, admin.role) === 0, '侧栏角标不再统计已删除文档的悬挂篇')
+
+// 12.3 同批多篇：仅删除其中一篇，其他流转篇与批次继续流转
+const docO = await mkDoc()
+const docP = await mkDoc()
+r = await handover.initiateHandover({ items: [{ docId: docO.id, toUserId: next.id }, { docId: docP.id, toUserId: third.id }], revokeMode: 'keep', note: '' }, owner)
+const hoOP = r.handover
+await handover.confirmHandover(hoOP.id, [docO.id], next) // docO 已确认待批准；docP 仍待确认
+await kb.deleteDoc(docP.id, admin)
+const hoOP1 = await getHo(hoOP.id)
+assert(itemOf(hoOP1, docP.id).status === HO_ITEM.CANCELLED, '同批中被删除的 docP 篇自动取消')
+assert(itemOf(hoOP1, docO.id).status === HO_ITEM.CONFIRMED, '同批中未删除的 docO 篇保持待批准')
+assert(hoOP1.status === HANDOVER.PENDING_APPROVAL, '批次整体仍可继续审批（待管理员批准）')
+await kb.deleteDoc(docO.id, admin)
+const hoOP2 = await getHo(hoOP.id)
+assert(itemOf(hoOP2, docO.id).status === HO_ITEM.CANCELLED && hoOP2.status === HANDOVER.CANCELLED, '剩余篇删除后批次全部取消')
+
+// 12.4 已完成转移的终态篇：历史结论不因文档删除而改变
+const docQ = await mkDoc()
+r = await handover.initiateHandover({ items: [{ docId: docQ.id, toUserId: next.id }], revokeMode: 'keep', note: '' }, owner)
+const hoQ = r.handover
+await handover.confirmHandover(hoQ.id, [docQ.id], next)
+await handover.decideHandover(hoQ.id, [docQ.id], 'approve', '', admin)
+await kb.deleteDoc(docQ.id, admin)
+const hoQDone = await getHo(hoQ.id)
+assert(itemOf(hoQDone, docQ.id).status === HO_ITEM.COMPLETED && itemOf(hoQDone, docQ.id).result, '已完成篇保留转移结论，不被删除联动改写')
+
+// 12.5 存量悬挂数据自愈：旧版本删除文档时未联动交接单，首次加载自动取消
+const docGhost = await mkDoc()
+r = await handover.initiateHandover({ items: [{ docId: docGhost.id, toUserId: next.id }], revokeMode: 'keep', note: '' }, owner)
+const hoGhost = r.handover
+// 绕过 store 内存态并直接删文档，模拟旧版本删除（未联动交接单）产生的悬挂数据
+handover.loaded = false
+await db.docs.delete(docGhost.id)
+await handover.loadAll()
+const hoGhostDone = await getHo(hoGhost.id)
+assert(itemOf(hoGhostDone, docGhost.id).status === HO_ITEM.CANCELLED, '首次加载自愈：文档已删除的流转篇自动取消')
+assert(hoGhostDone.timeline.some((t) => t.action === 'cancel' && t.by === 'system'), '自愈取消由系统留痕')
+assert(!handover.pendingConfirmFor(next.id).some((h) => h.id === hoGhost.id), '自愈后接任者不再看到悬挂待办')
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`)
 process.exit(failed ? 1 : 0)

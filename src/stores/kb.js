@@ -201,7 +201,7 @@ export const useKbStore = defineStore('kb', () => {
   async function deleteDoc(id, currentUser) {
     const userId = currentUser?.id || GUEST_ID
     let result = { status: 'ok' }
-    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, db.releaseGates, db.qaCitations, async () => {
+    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, db.releaseGates, db.qaCitations, db.handovers, async () => {
       const doc = await db.docs.get(id)
       if (!doc) { result = { status: 'missing' }; return }
       const pendingReview = await db.reviews
@@ -256,21 +256,28 @@ export const useKbStore = defineStore('kb', () => {
       // 已解决/已撤回的终态单保留结论、仅清空文档指针（页面按「文档已删除」展示）
       const { useCorrectionStore } = await import('./correction')
       await useCorrectionStore().resetTicketsOfDocTx(id, now)
+      // 责任交接：该文档流转中的交接篇（待接任者确认/待管理员批准）随删除自动取消——
+      // 否则接任者的待确认项与管理员的待批准项会指向不存在的文档；已终态的篇保留历史结论
+      const { useHandoverStore } = await import('./handover')
+      await useHandoverStore().cancelItemsOfDocTx(id, userId, now)
     })
     comments.value = comments.value.filter((c) => c.docId !== id)
     const gap = useGapStore()
     const { useFreshnessStore } = await import('./freshness')
     const { useCorrectionStore } = await import('./correction')
     const { useReleaseStore } = await import('./release')
+    const { useHandoverStore } = await import('./handover')
     const freshness = useFreshnessStore()
     const correction = useCorrectionStore()
     const releaseGate = useReleaseStore()
+    const handover = useHandoverStore()
     await Promise.all([
       reloadDocs(),
       gap.reload(),
       freshness.loaded ? freshness.reload() : Promise.resolve(),
       correction.loaded ? correction.reload() : Promise.resolve(),
-      releaseGate.loaded ? releaseGate.reload() : Promise.resolve()
+      releaseGate.loaded ? releaseGate.reload() : Promise.resolve(),
+      handover.loaded ? handover.reload() : Promise.resolve()
     ])
     return result
   }

@@ -7,6 +7,7 @@
 // 复核并发变更：校验与回退均以「篇」为单位，冲突篇标记失败（failed），不影响同批其他篇的确认
 // 与转移；单篇转移写入异常由 Dexie 事务整体回滚，不产生部分写入。
 import { ROLE, isGuestUser } from './permission'
+import { buildTimelineEntry } from './review'
 
 // 交接篇（单篇文档）状态：交接流转的最小单元
 export const HO_ITEM = {
@@ -55,6 +56,29 @@ export function handoverStatusOf(h) {
 // 单篇是否仍在流转中（可确认/可审批/可取消）
 export function isItemOpen(item) {
   return !!item && (item.status === HO_ITEM.PENDING_CONFIRM || item.status === HO_ITEM.CONFIRMED)
+}
+
+// 取消交接单中指定文档的流转中篇（纯函数：返回更新后的交接单副本；无流转中篇时返回 null）。
+// 文档被删除时由 kb.deleteDoc 同事务调用——交接依附的文档不存在，待确认/待批准篇继续保留只会
+// 让接任者与管理员的待办指向不存在的文档；已终态的篇（完成/谢绝/驳回/失败）不受影响，历史全程保留。
+export function cancelOpenItemsOfDoc(h, docIds, byUserId, reason, nowIso) {
+  if (!h) return null
+  const wanted = new Set(docIds || [])
+  const openItems = (h.items || []).filter((it) => wanted.has(it.docId) && isItemOpen(it))
+  if (!openItems.length) return null
+  const items = h.items.map((it) =>
+    wanted.has(it.docId) && isItemOpen(it) ? { ...it, status: HO_ITEM.CANCELLED, decidedBy: byUserId, decidedAt: nowIso, failReason: reason } : it
+  )
+  const updated = {
+    ...h,
+    items,
+    timeline: [
+      ...(h.timeline || []),
+      buildTimelineEntry('cancel', byUserId, '关联文档已删除，自动取消 ' + openItems.length + ' 篇流转中的交接：' + openItems.map((it) => '《' + it.title + '》').join(''), nowIso)
+    ]
+  }
+  updated.status = handoverStatusOf(updated)
+  return updated
 }
 
 // 交接单是否仍在流转中（任一篇待确认或待批准）

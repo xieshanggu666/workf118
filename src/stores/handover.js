@@ -6,7 +6,8 @@ import { buildTimelineEntry } from '@/utils/review'
 import { ACCESS, isGrantActive, buildAccessTimelineEntry } from '@/utils/access'
 import { isFreshTicketOpen, buildFreshTimelineEntry } from '@/utils/freshness'
 import {
-  HO_ITEM, REVOKE_MODE, isItemOpen, handoverStatusOf, handoverSnapshotOf, checkHandoverConflicts
+  HO_ITEM, REVOKE_MODE, isItemOpen, handoverStatusOf, handoverSnapshotOf, checkHandoverConflicts,
+  cancelOpenItemsOfDoc
 } from '@/utils/handover'
 import { GAP } from '@/utils/gap'
 import { CORRECTION } from '@/utils/correction'
@@ -37,10 +38,48 @@ export const useHandoverStore = defineStore('handover', () => {
     if (loaded.value) return
     await reload()
     loaded.value = true
+    // 首次加载自愈：历史上在交接流转中被删除的文档（旧版本删除时未联动交接单），
+    // 其待确认/待批准篇自动取消，避免接任者与管理员的待办长期指向不存在的文档
+    await reconcileDeletedDocItems()
   }
 
   async function reload() {
     handovers.value = await db.handovers.toArray()
+  }
+
+  // 删除文档时连带处理：该文档仍在流转中的交接篇（待确认/待批准）自动取消，
+  // 已终态的篇与交接历史不动。在 kb.deleteDoc 同事务内调用，取消与删除原子生效
+  async function cancelItemsOfDocTx(docId, byUserId, nowIso) {
+    const reason = '文档已删除，交接标的不存在，该篇自动取消'
+    const linked = await db.handovers.filter((h) => (h.items || []).some((i) => i.docId === docId && isItemOpen(i))).toArray()
+    for (const h of linked) {
+      const updated = cancelOpenItemsOfDoc(h, [docId], byUserId, reason, nowIso)
+      if (updated) await db.handovers.put(updated)
+    }
+  }
+
+  // 自愈存量悬挂篇：扫描流转中的交接篇，凡文档已不存在一律自动取消并留痕
+  async function reconcileDeletedDocItems() {
+    const openDocIds = new Set()
+    for (const h of handovers.value) {
+      for (const it of h.items || []) if (isItemOpen(it)) openDocIds.add(it.docId)
+    }
+    if (!openDocIds.size) return
+    const existing = new Set(await db.docs.where('id').anyOf([...openDocIds]).primaryKeys())
+    const missingIds = [...openDocIds].filter((id) => !existing.has(id))
+    if (!missingIds.length) return
+    const nowIso = new Date().toISOString()
+    const reason = '文档已删除，交接标的不存在，该篇自动取消'
+    let changed = false
+    await db.transaction('rw', db.handovers, async () => {
+      // 事务内重读库中最新记录（内存中的为 Vue 响应式代理，直接 put 会触发结构化克隆异常）
+      const all = await db.handovers.toArray()
+      for (const h of all) {
+        const updated = cancelOpenItemsOfDoc(h, missingIds, 'system', reason, nowIso)
+        if (updated) { await db.handovers.put(updated); changed = true }
+      }
+    })
+    if (changed) await reload()
   }
 
   const sorted = computed(() =>
@@ -498,6 +537,7 @@ export const useHandoverStore = defineStore('handover', () => {
     handovers, loaded, loadAll, reload, sorted,
     pendingConfirmFor, pendingApprovalFor, initiatedBy, involvedIn,
     activeHandoverOfDoc, activeItemOfDoc, pendingCountFor,
-    initiateHandover, confirmHandover, declineHandover, cancelHandover, decideHandover
+    initiateHandover, confirmHandover, declineHandover, cancelHandover, decideHandover,
+    cancelItemsOfDocTx, reconcileDeletedDocItems
   }
 })
