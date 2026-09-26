@@ -4,6 +4,7 @@
 // （先确认先批、未确认不批）→ 批准篇统一转移（所有权 + 历史归属 + 评审待办 + 保鲜责任 +
 // 待审批访问申请 + 原负责人名下流转工单改挂 + 按决定收回权限并取消其待审批申请）→
 // 交接期间并发变更（含保鲜配置来源转换）：冲突篇失败回退、同批一致篇正常转移；
+// 删除交接中的文档：非管理员拦截（in-handover），管理员删除同事务联动取消流转中交接篇并留痕；
 // 驳回 / 取消 / 多次交接历史累积 / 批次状态派生纯函数。
 // 运行：npm run test:handover
 import 'fake-indexeddb/auto'
@@ -19,7 +20,7 @@ import { useFreshnessStore } from '@/stores/freshness'
 import { useHandoverStore } from '@/stores/handover'
 import { uid } from '@/utils/format'
 import {
-  HO_ITEM, HANDOVER, REVOKE_MODE, isHandoverOpen, handoverStatusOf, checkHandoverConflicts
+  HO_ITEM, HANDOVER, REVOKE_MODE, isHandoverOpen, isItemOpen, handoverStatusOf, checkHandoverConflicts
 } from '@/utils/handover'
 import { canDecideAccess, ACCESS, isGrantActive } from '@/utils/access'
 import { PUBLISH } from '@/utils/review'
@@ -480,8 +481,43 @@ assert(r.status === 'ok' && r.done === 0 && r.failures[0].fields.includes('保�
 assert((await getDoc(docL.id)).ownerId === owner.id, 'docL 所有权未转移')
 assert(itemOf(await getHo(hoL.id), docL.id).status === HO_ITEM.FAILED, 'docL 篇标记失败回退')
 
-// ---------- 11. 纯函数：并发校验与批次状态派生 ----------
-console.log('\n[11] 并发变更校验与批次状态派生纯函数')
+// ---------- 11. 删除交接中的文档：非管理员拦截，管理员删除联动取消交接篇 ----------
+console.log('\n[11] 删除责任交接中的文档：交接篇联动取消，不留悬挂待办')
+const docM = await mkDoc()
+const docN = await mkDoc()
+r = await handover.initiateHandover({ items: [{ docId: docM.id, toUserId: next.id }, { docId: docN.id, toUserId: third.id }], revokeMode: 'keep', note: '' }, owner)
+const hoD = r.handover
+await handover.confirmHandover(hoD.id, [docM.id], next) // docM 已确认待批准；docN 仍待接任者确认
+assert(handover.pendingApprovalFor('admin').some((h) => h.id === hoD.id), '删除前：管理员待批准列表包含该交接单')
+assert(handover.pendingConfirmFor(third.id).some((h) => h.id === hoD.id), '删除前：接任者待确认列表包含该交接单')
+// 非管理员（含负责人本人）删除被拦截
+r = await kb.deleteDoc(docM.id, owner)
+assert(r.status === 'in-handover', '交接流转中：负责人删除被拦截（先完成/取消交接）')
+assert(await getDoc(docM.id), '被拦截后文档仍在')
+assert(isItemOpen(itemOf(await getHo(hoD.id), docM.id)), '被拦截后交接篇仍流转中')
+// 管理员删除：已确认待批准篇随文档删除联动取消
+r = await kb.deleteDoc(docM.id, admin)
+assert(r.status === 'ok', '管理员可直接删除交接中的文档')
+assert(!(await getDoc(docM.id)), '文档已删除')
+let hoDCur = await getHo(hoD.id)
+assert(itemOf(hoDCur, docM.id).status === HO_ITEM.CANCELLED, '已删除文档的交接篇（已确认待批准）联动取消')
+assert(itemOf(hoDCur, docN.id).status === HO_ITEM.PENDING_CONFIRM, '同批其他文档的交接篇不受影响')
+assert(hoDCur.status === HANDOVER.PENDING_CONFIRM, '批次状态由剩余篇派生（仍待接任者确认）')
+assert(hoDCur.timeline.some((t) => t.action === 'cancel' && t.by === 'system' && t.note.includes(docM.title)), '取消留痕：关联文档已删除')
+assert(!handover.pendingApprovalFor('admin').some((h) => h.id === hoD.id), '待批准列表不再出现指向已删除文档的交接单')
+assert(!handover.activeHandoverOfDoc(docM.id), '已删除文档不再占用流转中交接')
+// 待确认篇同样联动取消
+r = await kb.deleteDoc(docN.id, admin)
+assert(r.status === 'ok', '管理员删除含待确认篇的文档')
+hoDCur = await getHo(hoD.id)
+assert(itemOf(hoDCur, docN.id).status === HO_ITEM.CANCELLED, '待确认篇随文档删除联动取消')
+assert(hoDCur.status === HANDOVER.CANCELLED, '全部篇取消 → 批次已取消')
+assert(!handover.pendingConfirmFor(third.id).some((h) => h.id === hoD.id), '接任者待确认列表不再出现指向已删除文档的交接单')
+r = await handover.confirmHandover(hoD.id, [docN.id], third)
+assert(r.status === 'changed', '已取消的交接篇不能再确认')
+
+// ---------- 12. 纯函数：并发校验与批次状态派生 ----------
+console.log('\n[12] 并发变更校验与批次状态派生纯函数')
 const snapItems = [
   { docId: 'x1', title: 'X1', snapshot: { ownerId: 'a', updatedAt: 't1', activeReviewId: null, freshnessSig: '-' } },
   { docId: 'x2', title: 'X2', snapshot: { ownerId: 'a', updatedAt: 't2', activeReviewId: 'r1', freshnessSig: '30|d|1|' } }

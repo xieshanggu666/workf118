@@ -494,10 +494,35 @@ export const useHandoverStore = defineStore('handover', () => {
     return result
   }
 
+  // 删除文档时连带处理：该文档流转中的交接篇（待确认/待批准）随文档一并取消并留痕
+  // （在 kb.deleteDoc 同事务内调用）。交接篇指向的文档已不存在，留着会让接任者确认/
+  // 管理员批准继续落到空文档上（待办悬挂）；同批其他文档的交接篇不受影响（逐篇独立），
+  // 批次整体状态由剩余篇状态重新派生。
+  async function cancelItemsOfDocTx(docId, nowIso) {
+    const list = await db.handovers
+      .filter((h) => (h.items || []).some((i) => i.docId === docId && isItemOpen(i)))
+      .toArray()
+    for (const h of list) {
+      const target = (h.items || []).find((i) => i.docId === docId && isItemOpen(i))
+      if (!target) continue
+      const items = h.items.map((it) =>
+        it.docId === docId && isItemOpen(it) ? { ...it, status: HO_ITEM.CANCELLED } : it
+      )
+      const updated = {
+        ...h,
+        items,
+        timeline: [...(h.timeline || []), buildTimelineEntry('cancel', 'system', '关联文档已删除，交接取消：《' + target.title + '》', nowIso)]
+      }
+      updated.status = handoverStatusOf(updated)
+      await db.handovers.put(updated)
+    }
+  }
+
   return {
     handovers, loaded, loadAll, reload, sorted,
     pendingConfirmFor, pendingApprovalFor, initiatedBy, involvedIn,
     activeHandoverOfDoc, activeItemOfDoc, pendingCountFor,
-    initiateHandover, confirmHandover, declineHandover, cancelHandover, decideHandover
+    initiateHandover, confirmHandover, declineHandover, cancelHandover, decideHandover,
+    cancelItemsOfDocTx
   }
 })

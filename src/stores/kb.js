@@ -9,6 +9,7 @@ import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { canEditContent, canEditDoc, canDeleteDoc, GUEST_ID } from '@/utils/permission'
 import { isDocOverride, isFreshTicketOpen, materializeFromPolicy } from '@/utils/freshness'
 import { isGateStatusOpen } from '@/utils/release'
+import { isItemOpen } from '@/utils/handover'
 import { useAuthStore } from './auth'
 import { useGapStore } from './gap'
 
@@ -197,11 +198,13 @@ export const useKbStore = defineStore('kb', () => {
   }
 
   // 删除文档为破坏性操作：仅拥有者/固定协作成员/管理员可执行（限时协作授权与共享链接不授予删除权）；
-  // 访客、评审中（非管理员）同样拒绝。返回 { status: 'ok' | 'forbidden' | 'missing' }
+  // 访客、评审中（非管理员）同样拒绝。在途门禁/退役/替代关联/责任交接先走完流程再删除
+  // （管理员可直接删除，门禁与交接篇在同事务内联动收尾）。
+  // 返回 { status: 'ok' | 'forbidden' | 'missing' | 'in-gate' | 'in-retirement' | 'is-replacement' | 'in-handover' }
   async function deleteDoc(id, currentUser) {
     const userId = currentUser?.id || GUEST_ID
     let result = { status: 'ok' }
-    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, db.releaseGates, db.qaCitations, async () => {
+    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, db.releaseGates, db.qaCitations, db.handovers, async () => {
       const doc = await db.docs.get(id)
       if (!doc) { result = { status: 'missing' }; return }
       const pendingReview = await db.reviews
@@ -217,6 +220,9 @@ export const useKbStore = defineStore('kb', () => {
       // 作为他人退役替代文档：生效单必须先撤销退役，在途单必须先完成/取消，避免替代链断裂
       const usedAsReplacement = await db.retirements
         .filter((rt) => (rt.status === 'approved' || rt.status === 'pending') && rt.replacementDocId === id).first()
+      // 责任交接：该文档存在流转中的交接篇（待接任者确认/待管理员批准）
+      const openHandover = await db.handovers
+        .filter((h) => (h.items || []).some((i) => i.docId === id && isItemOpen(i))).first()
       if (!canDeleteDoc(doc, { userId, role: currentUser?.role, pendingReview, activeRetirement, openGate: gateLocked })) {
         result = { status: 'forbidden' }
         return
@@ -225,6 +231,8 @@ export const useKbStore = defineStore('kb', () => {
       if (gateLocked && currentUser?.role !== 'admin') { result = { status: 'in-gate' }; return }
       if (openRetirement) { result = { status: 'in-retirement' }; return }
       if (usedAsReplacement) { result = { status: 'is-replacement' }; return }
+      // 责任交接流转中：非管理员先完成/取消交接再删除（管理员可直接删除，下方联动取消交接篇）
+      if (openHandover && currentUser?.role !== 'admin') { result = { status: 'in-handover' }; return }
       await db.docs.delete(id)
       await db.comments.where('docId').equals(id).delete()
       await db.shares.where('docId').equals(id).delete()
@@ -256,21 +264,28 @@ export const useKbStore = defineStore('kb', () => {
       // 已解决/已撤回的终态单保留结论、仅清空文档指针（页面按「文档已删除」展示）
       const { useCorrectionStore } = await import('./correction')
       await useCorrectionStore().resetTicketsOfDocTx(id, now)
+      // 责任交接：流转中的交接篇随文档删除取消并留痕——留着会让接任者确认/管理员批准
+      // 继续指向已删除的文档（待办悬挂）；同批其他文档的交接篇不受影响
+      const { useHandoverStore } = await import('./handover')
+      await useHandoverStore().cancelItemsOfDocTx(id, now)
     })
     comments.value = comments.value.filter((c) => c.docId !== id)
     const gap = useGapStore()
     const { useFreshnessStore } = await import('./freshness')
     const { useCorrectionStore } = await import('./correction')
     const { useReleaseStore } = await import('./release')
+    const { useHandoverStore } = await import('./handover')
     const freshness = useFreshnessStore()
     const correction = useCorrectionStore()
     const releaseGate = useReleaseStore()
+    const handover = useHandoverStore()
     await Promise.all([
       reloadDocs(),
       gap.reload(),
       freshness.loaded ? freshness.reload() : Promise.resolve(),
       correction.loaded ? correction.reload() : Promise.resolve(),
-      releaseGate.loaded ? releaseGate.reload() : Promise.resolve()
+      releaseGate.loaded ? releaseGate.reload() : Promise.resolve(),
+      handover.loaded ? handover.reload() : Promise.resolve()
     ])
     return result
   }

@@ -194,6 +194,10 @@ async function doDelete() {
     alert('该文档正作为某篇已退役文档的替代文档，请先撤销对应退役后再删除。')
     return
   }
+  if (res?.status === 'in-handover') {
+    alert('该文档存在流转中的责任交接，请先完成或取消交接后再删除。')
+    return
+  }
   router.push('/docs')
 }
 
